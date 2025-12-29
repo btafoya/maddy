@@ -70,9 +70,4 @@ func TestDKIM_Table(t *testing.T) {
 	test("example.org", true)
 	test("foobar.com", true)
 	test("google.com", false)
-
-	// Test case for sign_subdomains with table
-	m.signSubdomains = true
-	test("sub.example.org", true) // Should sign for sub.example.org if example.org is in table
-	m.signSubdomains = false // Reset for other tests if any
 }

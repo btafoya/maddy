@@ -152,25 +152,21 @@ func (m *Modifier) Init(cfg *config.Map) error {
 
 	cfg.Bool("debug", true, false, &m.log.Debug)
 
-	// We can't use cfg.StringList for domains since it can be a table.
-	// So we handle it manually.
-	if len(m.domains) == 0 { // Not set via inline args.
-		for _, node := range cfg.Block.Children {
-			if node.Name == "domains" {
-				if len(node.Args) == 1 && strings.HasPrefix(node.Args[0], "&") {
-					var tableModule module.Table
-					err := cfgmodule.ModuleFromNode("table", node.Args, node, cfg.Globals, &tableModule)
-					if err != nil {
-						return err
-					}
-					m.domainsTable = tableModule
-				} else {
-					m.domains = node.Args
-				}
-				break
+	// Custom handling for 'domains' directive to support both static list and table reference.
+	cfg.Custom("domains", false, false, nil, func(cfg *config.Map, node config.Node) (interface{}, error) {
+		if len(node.Args) == 1 && strings.HasPrefix(node.Args[0], "&") {
+			var tableModule module.Table
+			err := cfgmodule.ModuleFromNode("table", node.Args, node, cfg.Globals, &tableModule)
+			if err != nil {
+				return nil, err
 			}
+			m.domainsTable = tableModule
+			return nil, nil // Value stored directly in m.domainsTable
+		} else {
+			m.domains = node.Args
+			return node.Args, nil
 		}
-	}
+	}, nil)
 
 	cfg.String("selector", false, false, m.selector, &m.selector)
 	cfg.String("key_path", false, false, "dkim_keys/{domain}_{selector}.key", &m.keyPathTemplate)

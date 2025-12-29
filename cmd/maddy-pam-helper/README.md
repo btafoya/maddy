@@ -5,13 +5,29 @@ privileged objects necessary to run PAM authentication.
 
 ### Building
 
-It is really easy to build it using any GCC:
-```
-gcc pam.c main.c -lpam -o maddy-pam-helper
+#### Option 1: Using Go (Recommended)
+
+Build with the `libpam` tag to enable PAM support:
+
+```bash
+# Requires PAM development headers:
+# Debian/Ubuntu: apt install libpam0g-dev
+# Fedora/RHEL:   dnf install pam-devel
+# Alpine:        apk add linux-pam-dev
+# Arch:          pacman -S pam
+
+go build -tags libpam ./cmd/maddy-pam-helper
 ```
 
-Yes, it is not a Go binary.
+**Without PAM headers**, the build produces a stub binary that displays helpful instructions when run.
 
+#### Option 2: Using GCC directly
+
+For a smaller binary, compile the C sources directly:
+
+```bash
+gcc csrc/pam.c csrc/main.c -lpam -o maddy-pam-helper
+```
 
 ### Installation
 
@@ -63,3 +79,17 @@ Because of this you should configure PAM to accept it.
 Minimal example using local passwd/shadow database for authentication can be
 found in [maddy.conf][maddy.conf] file.
 It should be put into /etc/pam.d/maddy.
+
+### File Structure
+
+```
+cmd/maddy-pam-helper/
+├── main.go         # Go wrapper (requires -tags libpam)
+├── main_nopam.go   # Stub when PAM unavailable
+├── maddy.conf      # Example PAM service config
+├── README.md       # This file
+└── csrc/           # C source files
+    ├── main.c      # Entry point
+    ├── pam.c       # PAM authentication logic
+    └── pam.h       # Header file
+```

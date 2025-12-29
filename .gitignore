@@ -51,3 +51,4 @@ tests/maddy
 .gemini/
 gha-creds-*.json
 PR.md
+.serena/

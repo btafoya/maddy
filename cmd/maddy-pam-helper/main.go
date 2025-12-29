@@ -1,3 +1,6 @@
+//go:build cgo && libpam
+// +build cgo,libpam
+
 /*
 Maddy Mail Server - Composable all-in-one email server.
 Copyright © 2019-2020 Max Mazurov <fox.cpp@disroot.org>, Maddy Mail Server contributors
@@ -20,8 +23,9 @@ package main
 
 /*
 #cgo LDFLAGS: -lpam
-#cgo CFLAGS: -DCGO -Wall -Wextra -Werror -Wno-unused-parameter -Wno-error=unused-parameter -Wpedantic -std=c99
-extern int run();
+#cgo CFLAGS: -DCGO -Wall -Wextra -Werror -Wno-unused-parameter -Wno-error=unused-parameter -Wpedantic -std=c99 -I${SRCDIR}/csrc
+#include "csrc/pam.c"
+#include "csrc/main.c"
 */
 import "C"
 import "os"

@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package table
 
 import (
+	"context"
 	"os"
 	"reflect"
 	"testing"
@@ -214,6 +215,72 @@ func TestFileReload_Removed(t *testing.T) {
 	defer m.mLck.RUnlock()
 	if m.m["cat"] != nil {
 		t.Fatal("Old m are still loaded")
+	}
+}
+
+func TestFileLookupWithRelativeAliases(t *testing.T) {
+	t.Parallel()
+
+	// Create a temporary alias file
+	aliasContent := `
+user: newuser
+user@example.com: newuser@other.com
+localpartonly: fulladdress@example.net
+`
+	f, err := os.CreateTemp("", "maddy-aliases-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if _, err := f.WriteString(aliasContent); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a table.File instance
+	mod, err := NewFile("", "", nil, []string{f.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := mod.(*File)
+	m.log = testutils.Logger(t, FileModName)
+	defer m.Close()
+
+	if err := m.Init(&config.Map{Block: config.Node{}}); err != nil {
+		t.Fatal(err)
+	}
+
+	type testCase struct {
+		input    string
+		expected string
+		found    bool
+		err      error
+	}
+
+	tests := []testCase{
+		{"user@example.com", "newuser@other.com", true, nil},    // Absolute match
+		{"user@domain.org", "newuser@domain.org", true, nil},    // Relative match: user -> newuser@domain.org
+		{"localpartonly@test.com", "fulladdress@example.net", true, nil}, // Relative match with full address alias
+		{"nonexistent@example.com", "", false, nil}, // No match
+		{"unknown", "", false, nil},                 // No match (localpart)
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			actual, found, err := m.Lookup(context.Background(), tc.input)
+
+			if err != tc.err {
+				t.Errorf("Lookup() error = %v, wantErr %v", err, tc.err)
+				return
+			}
+			if found != tc.found {
+				t.Errorf("Lookup() found = %v, wantFound %v", found, tc.found)
+				return
+			}
+			if actual != tc.expected {
+				t.Errorf("Lookup() actual = %v, want %v", actual, tc.expected)
+			}
+		})
 	}
 }
 

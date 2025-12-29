@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/foxcpp/maddy/framework/address"
 	"github.com/foxcpp/maddy/framework/config"
 	"github.com/foxcpp/maddy/framework/hooks"
 	"github.com/foxcpp/maddy/framework/log"
@@ -236,13 +237,30 @@ func (f *File) Lookup(_ context.Context, val string) (string, bool, error) {
 	usedFile := f.m
 	f.mLck.RUnlock()
 
-	newVal, ok := usedFile[val]
-
-	if len(newVal) == 0 {
-		return "", false, nil
+	// 1. Try exact match (e.g., "cat@example.com" -> "dog@example.com")
+	if aliasValues, ok := usedFile[val]; ok && len(aliasValues) > 0 {
+		return aliasValues[0], true, nil
 	}
 
-	return newVal[0], ok, nil
+	// 2. If val contains '@', try lookup with local-part (e.g., "cat@example.com" -> "cat")
+	if strings.Contains(val, "@") {
+		localPart, domainPart, err := address.Split(val)
+		if err != nil {
+			// Malformed address, treat as no match for local-part rule.
+			return "", false, nil
+		}
+
+		if aliasValues, ok := usedFile[localPart]; ok && len(aliasValues) > 0 {
+			// If alias value does not contain '@', append original domain part
+			if !strings.Contains(aliasValues[0], "@") {
+				return aliasValues[0] + "@" + domainPart, true, nil
+			}
+			// Otherwise, return as is (full address)
+			return aliasValues[0], true, nil
+		}
+	}
+
+	return "", false, nil
 }
 
 func (f *File) LookupMulti(_ context.Context, val string) ([]string, error) {

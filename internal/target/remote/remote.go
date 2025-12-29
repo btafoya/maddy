@@ -30,7 +30,6 @@ import (
 	"fmt"
 	"net"
 	"runtime/trace"
-	"strings"
 	"sync"
 	"time"
 
@@ -74,6 +73,8 @@ type Target struct {
 	limits            *limits.Group
 	allowSecOverride  bool
 	relaxedREQUIRETLS bool
+	insecureRSACiphers bool
+	allowIPLiterals bool
 
 	pool           *pool.P
 	connReuseLimit int
@@ -137,6 +138,8 @@ func (rt *Target) Init(cfg *config.Map) error {
 	}, &rt.limits)
 	cfg.Bool("requiretls_override", false, true, &rt.allowSecOverride)
 	cfg.Bool("relaxed_requiretls", false, true, &rt.relaxedREQUIRETLS)
+	cfg.Bool("insecure_rsa_ciphers", false, false, &rt.insecureRSACiphers)
+	cfg.Bool("allow_ip_literals", false, false, &rt.allowIPLiterals)
 	cfg.Int("conn_reuse_limit", false, false, 10, &rt.connReuseLimit)
 	cfg.Duration("connect_timeout", false, false, 5*time.Minute, &rt.connectTimeout)
 	cfg.Duration("command_timeout", false, false, 5*time.Minute, &rt.commandTimeout)
@@ -154,6 +157,30 @@ func (rt *Target) Init(cfg *config.Map) error {
 	if _, err := cfg.Process(); err != nil {
 		return err
 	}
+
+	if rt.tlsConfig != nil && rt.insecureRSACiphers {
+		if len(rt.tlsConfig.CipherSuites) == 0 {
+			// This is based on default Go 1.18 ciphers, with legacy RSA ciphers
+			// appended. We use a static list to avoid pulling in a lot of ciphers
+			// that are not useful for mail servers and to have a consistent behavior.
+			rt.tlsConfig.CipherSuites = []uint16{
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+
+				// Legacy RSA key exchange, disabled by default in Go 1.22+.
+				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+				tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+				tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+			}
+		}
+	}
+
 	rt.pool = pool.New(poolCfg)
 
 	// INTERNATIONALIZATION: See RFC 6531 Section 3.7.1.
@@ -294,15 +321,6 @@ func (rd *remoteDelivery) AddRcpt(ctx context.Context, to string, opts smtp.Rcpt
 			Code:         550,
 			EnhancedCode: exterrors.EnhancedCode{5, 1, 1},
 			Message:      "<postmaster> address it no supported",
-			TargetName:   "remote",
-		}
-	}
-
-	if strings.HasPrefix(domain, "[") {
-		return &exterrors.SMTPError{
-			Code:         550,
-			EnhancedCode: exterrors.EnhancedCode{5, 1, 1},
-			Message:      "IP address literals are not supported",
 			TargetName:   "remote",
 		}
 	}

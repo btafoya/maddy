@@ -25,6 +25,7 @@ import (
 	"net"
 	"runtime/trace"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/foxcpp/maddy/framework/config"
@@ -355,22 +356,51 @@ func (rd *remoteDelivery) newConn(ctx context.Context, domain string) (*mxConn, 
 }
 
 func (rd *remoteDelivery) lookupMX(ctx context.Context, domain string) (dnssecOk bool, records []*net.MX, err error) {
+	if strings.HasPrefix(domain, "[") {
+		if !rd.rt.allowIPLiterals {
+			return false, nil, &exterrors.SMTPError{
+				Code:         550,
+				EnhancedCode: exterrors.EnhancedCode{5, 1, 1},
+				Message:      "IP address literals are not supported",
+				TargetName:   "remote",
+			}
+		}
+		ipStr := strings.Trim(domain, "[]")
+		// As per RFC 5321, address literals can be "IPv6:..."
+		if strings.HasPrefix(ipStr, "IPv6:") {
+			ipStr = ipStr[5:]
+		}
+		if net.ParseIP(ipStr) == nil {
+			return false, nil, &exterrors.SMTPError{
+				Code:         550,
+				EnhancedCode: exterrors.EnhancedCode{5, 1, 1},
+				Message:      "Invalid IP address literal",
+				TargetName:   "remote",
+			}
+		}
+
+		return false, []*net.MX{{Host: ipStr, Pref: 0}}, nil
+	}
+
 	if rd.rt.extResolver != nil {
 		dnssecOk, records, err = rd.rt.extResolver.AuthLookupMX(context.Background(), domain)
 	} else {
 		records, err = rd.rt.resolver.LookupMX(ctx, dns.FQDN(domain))
 	}
 	if err != nil {
-		reason, misc := exterrors.UnwrapDNSErr(err)
-		return false, nil, &exterrors.SMTPError{
-			Code:         exterrors.SMTPCode(err, 451, 554),
-			EnhancedCode: exterrors.SMTPEnchCode(err, exterrors.EnhancedCode{0, 4, 4}),
-			Message:      "MX lookup error",
-			TargetName:   "remote",
-			Reason:       reason,
-			Err:          err,
-			Misc:         misc,
+		if !dns.IsNotFound(err) {
+			reason, misc := exterrors.UnwrapDNSErr(err)
+			return false, nil, &exterrors.SMTPError{
+				Code:         exterrors.SMTPCode(err, 451, 554),
+				EnhancedCode: exterrors.SMTPEnchCode(err, exterrors.EnhancedCode{0, 4, 4}),
+				Message:      "MX lookup error",
+				TargetName:   "remote",
+				Reason:       reason,
+				Err:          err,
+				Misc:         misc,
+			}
 		}
+		err = nil
 	}
 
 	sort.Slice(records, func(i, j int) bool {

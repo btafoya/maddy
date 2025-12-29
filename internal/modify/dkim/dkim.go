@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"runtime/trace"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-message/textproto"
@@ -34,6 +35,7 @@ import (
 	"github.com/foxcpp/maddy/framework/address"
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/config"
+	cfgmodule "github.com/foxcpp/maddy/framework/config/module"
 	"github.com/foxcpp/maddy/framework/dns"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/log"
@@ -96,17 +98,21 @@ var (
 type Modifier struct {
 	instName string
 
-	domains        []string
-	selector       string
-	signers        map[string]crypto.Signer
-	oversignHeader []string
-	signHeader     []string
-	headerCanon    dkim.Canonicalization
-	bodyCanon      dkim.Canonicalization
-	sigExpiry      time.Duration
-	hash           crypto.Hash
-	multipleFromOk bool
-	signSubdomains bool
+	domains          []string
+	domainsTable     module.Table
+	selector         string
+	keyPathTemplate  string
+	newKeyAlgo       string
+	signers          map[string]crypto.Signer
+	signersLock      sync.RWMutex
+	oversignHeader   []string
+	signHeader       []string
+	headerCanon      dkim.Canonicalization
+	bodyCanon        dkim.Canonicalization
+	sigExpiry        time.Duration
+	hash             crypto.Hash
+	multipleFromOk   bool
+	signSubdomains   bool
 
 	log log.Logger
 }
@@ -141,15 +147,33 @@ func (m *Modifier) InstanceName() string {
 
 func (m *Modifier) Init(cfg *config.Map) error {
 	var (
-		hashName        string
-		keyPathTemplate string
-		newKeyAlgo      string
+		hashName string
 	)
 
 	cfg.Bool("debug", true, false, &m.log.Debug)
-	cfg.StringList("domains", false, false, m.domains, &m.domains)
+
+	// We can't use cfg.StringList for domains since it can be a table.
+	// So we handle it manually.
+	if len(m.domains) == 0 { // Not set via inline args.
+		for _, node := range cfg.Block.Children {
+			if node.Name == "domains" {
+				if len(node.Args) == 1 && strings.HasPrefix(node.Args[0], "&") {
+					var tableModule module.Table
+					err := cfgmodule.ModuleFromNode("table", node.Args, node, cfg.Globals, &tableModule)
+					if err != nil {
+						return err
+					}
+					m.domainsTable = tableModule
+				} else {
+					m.domains = node.Args
+				}
+				break
+			}
+		}
+	}
+
 	cfg.String("selector", false, false, m.selector, &m.selector)
-	cfg.String("key_path", false, false, "dkim_keys/{domain}_{selector}.key", &keyPathTemplate)
+	cfg.String("key_path", false, false, "dkim_keys/{domain}_{selector}.key", &m.keyPathTemplate)
 	cfg.StringList("oversign_fields", false, false, oversignDefault, &m.oversignHeader)
 	cfg.StringList("sign_fields", false, false, signDefault, &m.signHeader)
 	cfg.Enum("header_canon", false, false,
@@ -162,7 +186,7 @@ func (m *Modifier) Init(cfg *config.Map) error {
 	cfg.Enum("hash", false, false,
 		[]string{"sha256"}, "sha256", &hashName)
 	cfg.Enum("newkey_algo", false, false,
-		[]string{"rsa4096", "rsa2048", "ed25519"}, "rsa2048", &newKeyAlgo)
+		[]string{"rsa4096", "rsa2048", "ed25519"}, "rsa2048", &m.newKeyAlgo)
 	cfg.Bool("allow_multiple_from", false, false, &m.multipleFromOk)
 	cfg.Bool("sign_subdomains", false, false, &m.signSubdomains)
 
@@ -170,7 +194,7 @@ func (m *Modifier) Init(cfg *config.Map) error {
 		return err
 	}
 
-	if len(m.domains) == 0 {
+	if len(m.domains) == 0 && m.domainsTable == nil {
 		return errors.New("sign_domain: at least one domain is needed")
 	}
 	if m.selector == "" {
@@ -185,15 +209,19 @@ func (m *Modifier) Init(cfg *config.Map) error {
 		panic("modify.dkim.Init: Hash function allowed by config matcher but not present in hashFuncs")
 	}
 
+	if m.domainsTable != nil {
+		return nil
+	}
+
 	for _, domain := range m.domains {
 		if _, err := idna.ToASCII(domain); err != nil {
 			m.log.Printf("warning: unable to convert domain %s to A-labels form, non-EAI messages will not be signed: %v", domain, err)
 		}
 
 		keyValues := strings.NewReplacer("{domain}", domain, "{selector}", m.selector)
-		keyPath := keyValues.Replace(keyPathTemplate)
+		keyPath := keyValues.Replace(m.keyPathTemplate)
 
-		signer, newKey, err := m.loadOrGenerateKey(keyPath, newKeyAlgo)
+		signer, newKey, err := m.loadOrGenerateKey(keyPath, m.newKeyAlgo)
 		if err != nil {
 			return err
 		}
@@ -205,7 +233,7 @@ func (m *Modifier) Init(cfg *config.Map) error {
 			}
 			m.log.Printf("generated a new %s keypair, private key is in %s, TXT record with public key is in %s,\n"+
 				"put its contents into TXT record for %s._domainkey.%s to make signing and verification work",
-				newKeyAlgo, keyPath, dnsPath, m.selector, domain)
+				m.newKeyAlgo, keyPath, dnsPath, m.selector, domain)
 		}
 
 		normDomain, err := dns.ForLookup(domain)
@@ -292,20 +320,13 @@ func (s *state) RewriteBody(ctx context.Context, h *textproto.Header, body buffe
 	}
 	selector := s.m.selector
 
-	if s.m.signSubdomains {
-		topDomain := s.m.domains[0]
-		if strings.HasSuffix(domain, "."+topDomain) {
-			domain = topDomain
-		}
-	}
-	normDomain, err := dns.ForLookup(domain)
+	keySigner, err := s.m.signerFor(ctx, domain)
 	if err != nil {
-		s.log.Error("unable to normalize domain from envelope sender", err, "domain", domain)
+		s.log.Error("failed to get signer", err, "domain", domain)
 		return nil
 	}
-	keySigner := s.m.signers[normDomain]
 	if keySigner == nil {
-		s.log.Msg("no key for domain", "domain", normDomain)
+		s.log.Msg("no key for domain", "domain", domain)
 		return nil
 	}
 
@@ -365,6 +386,65 @@ func (s *state) RewriteBody(ctx context.Context, h *textproto.Header, body buffe
 
 	return nil
 }
+
+func (m *Modifier) signerFor(ctx context.Context, domain string) (crypto.Signer, error) {
+	normDomain, err := dns.ForLookup(domain)
+	if err != nil {
+		return nil, fmt.Errorf("sign_skim: unable to normalize domain %s: %w", domain, err)
+	}
+
+	m.signersLock.RLock()
+	signer := m.signers[normDomain]
+	m.signersLock.RUnlock()
+	if signer != nil {
+		return signer, nil
+	}
+
+	if m.domainsTable != nil {
+		_, ok, err := m.domainsTable.Lookup(ctx, normDomain)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, nil
+		}
+	} else if m.signSubdomains {
+		topDomain := m.domains[0]
+		if !strings.HasSuffix(normDomain, "."+topDomain) && normDomain != topDomain {
+			return nil, nil
+		}
+		normDomain = topDomain
+	}
+
+	m.signersLock.Lock()
+	defer m.signersLock.Unlock()
+
+	// Re-check, maybe other goroutine created it for us.
+	if signer := m.signers[normDomain]; signer != nil {
+		return signer, nil
+	}
+
+	keyValues := strings.NewReplacer("{domain}", normDomain, "{selector}", m.selector)
+	keyPath := keyValues.Replace(m.keyPathTemplate)
+
+	signer, newKey, err := m.loadOrGenerateKey(keyPath, m.newKeyAlgo)
+	if err != nil {
+		return nil, err
+	}
+
+	if newKey {
+		dnsPath := keyPath + ".dns"
+		if filepath.Ext(keyPath) == ".key" {
+			dnsPath = keyPath[:len(keyPath)-4] + ".dns"
+		}
+		m.log.Printf("generated a new %s keypair, private key is in %s, TXT record with public key is in %s,\n"+
+			"put its contents into TXT record for %s._domainkey.%s to make signing and verification work",
+			m.newKeyAlgo, keyPath, dnsPath, m.selector, domain)
+	}
+	m.signers[normDomain] = signer
+	return signer, nil
+}
+
 
 func (s state) Close() error {
 	return nil

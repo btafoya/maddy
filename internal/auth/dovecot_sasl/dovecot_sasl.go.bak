@@ -21,7 +21,6 @@ package dovecotsasl
 import (
 	"fmt"
 	"net"
-	"sync"
 
 	"github.com/emersion/go-sasl"
 	dovecotsasl "github.com/foxcpp/go-dovecot-sasl"
@@ -40,8 +39,7 @@ type Auth struct {
 	network string
 	addr    string
 
-	mechanisms     map[string]dovecotsasl.Mechanism
-	initMechanisms sync.Once
+	mechanisms map[string]dovecotsasl.Mechanism
 }
 
 const modName = "dovecot_sasl"
@@ -80,20 +78,8 @@ func (a *Auth) getConn() (*dovecotsasl.Client, error) {
 
 	cl, err := dovecotsasl.NewClient(conn)
 	if err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("%s: unable to contact server: %v", modName, err)
 	}
-
-	a.initMechanisms.Do(func() {
-		a.log.DebugMsg("conn info", "mechs", cl.ConnInfo().Mechs)
-		a.mechanisms = make(map[string]dovecotsasl.Mechanism, len(cl.ConnInfo().Mechs))
-		for name, mech := range cl.ConnInfo().Mechs {
-			if mech.Private {
-				continue
-			}
-			a.mechanisms[name] = mech
-		}
-	})
 
 	return cl, nil
 }
@@ -114,6 +100,26 @@ func (a *Auth) Init(cfg *config.Map) error {
 	endp, err := config.ParseEndpoint(a.serverEndpoint)
 	if err != nil {
 		return fmt.Errorf("%s: invalid server endpoint: %v", modName, err)
+	}
+
+	// Dial once to check usability and also to get list of mechanisms.
+	conn, err := net.Dial(endp.Scheme, endp.Address())
+	if err != nil {
+		return fmt.Errorf("%s: unable to contact server: %v", modName, err)
+	}
+
+	cl, err := dovecotsasl.NewClient(conn)
+	if err != nil {
+		return fmt.Errorf("%s: unable to contact server: %v", modName, err)
+	}
+
+	defer cl.Close()
+	a.mechanisms = make(map[string]dovecotsasl.Mechanism, len(cl.ConnInfo().Mechs))
+	for name, mech := range cl.ConnInfo().Mechs {
+		if mech.Private {
+			continue
+		}
+		a.mechanisms[name] = mech
 	}
 
 	a.network = endp.Scheme
